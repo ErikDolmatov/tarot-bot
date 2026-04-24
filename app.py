@@ -1,12 +1,24 @@
 import os
-import sqlite3
+import asyncio
+import logging
 import random
+import sqlite3
 from datetime import datetime
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-TOKEN = os.environ.get("BOT_TOKEN")
+# --- Логування ---
+logging.basicConfig(level=logging.INFO)
 
+# --- Конфігурація ---
+TOKEN = os.environ.get("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 8000))
+URL = os.environ.get("RENDER_EXTERNAL_URL", "https://your-app-name.onrender.com")
+
+# --- База даних (без змін, залишаємо ту саму логіку) ---
 def init_db():
     conn = sqlite3.connect('tarot_bot.db')
     c = conn.cursor()
@@ -82,6 +94,7 @@ def random_card():
 def make_prediction(name, zodiac, question, card_name):
     return (f"✨ *{name}*, карта *{card_name}* відкриває таємницю.\n\nТвоє питання: _{question}_\n\nЯ бачу, для {zodiac} настає час. {card_name} каже: прислухайся до себе. Не бійся кроку.\n\n🌙 Порада: довірся інтуїції.")
 
+# --- ОБРОБНИКИ БОТА (без змін) ---
 async def start(update: Update, context):
     user_id = update.effective_user.id
     user = get_user(user_id)
@@ -150,15 +163,55 @@ async def draw_card_callback(update: Update, context):
 async def help_command(update: Update, context):
     await update.message.reply_text("/start – почати\n/help – довідка\nНапиши питання і натисни кнопку.")
 
-def main():
+# --- ОСНОВНА ФУНКЦІЯ ДЛЯ ВЕБ-ХУКА ---
+async def main():
+    # Ініціалізуємо базу даних
     init_db()
+
+    # Створюємо екземпляр бота (Application)
     app = Application.builder().token(TOKEN).build()
+
+    # Додаємо обробники
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(draw_card_callback, pattern="draw_card"))
-    print("✅ Бот запущено")
-    app.run_polling()
 
+    # Встановлюємо веб-хук
+    webhook_url = f"{URL}/telegram"
+    await app.bot.set_webhook(webhook_url, allowed_updates=Update.ALL_TYPES)
+    logging.info(f"Webhook set to {webhook_url}")
+
+    # Створюємо Starlette додаток
+    async def telegram_webhook(request):
+        try:
+            # Отримуємо JSON дані з запиту
+            json_data = await request.json()
+            # Створюємо об'єкт Update
+            update = Update.de_json(json_data, app.bot)
+            # Додаємо оновлення в чергу для обробки ботом
+            await app.update_queue.put(update)
+            return Response()
+        except Exception as e:
+            logging.error(f"Error in webhook: {e}")
+            return Response(status_code=500)
+
+    async def healthcheck(request):
+        return PlainTextResponse("OK")
+
+    starlette_app = Starlette(routes=[
+        Route("/telegram", telegram_webhook, methods=["POST"]),
+        Route("/healthcheck", healthcheck, methods=["GET"]),
+        Route("/health", healthcheck, methods=["GET"]),
+    ])
+
+    # Запускаємо веб-сервер, передаючи йому додаток Telegram
+    config = uvicorn.Config(starlette_app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+
+    logging.info("Starting bot web server...")
+    await server.serve()
+
+# Точка входу
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
